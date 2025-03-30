@@ -1,17 +1,45 @@
+#!/usr/bin/env python3
 import cv2
 import pytesseract
 import re
 import os
+import sys
 
-image_path = "scripts/image3.png"
-overwrite_original = True  # set to True to replace the org image with the blurred one
+if len(sys.argv) < 3:
+    print("Usage: {} <input_image> <output_image> [kernel_size] [sigma]".format(sys.argv[0]))
+    sys.exit(1)
 
+# Get file paths from command line.
+image_path = sys.argv[1]
+output_path = sys.argv[2]
+
+print("Image Path : ",image_path)
+print("Output Image Path : ",output_path)
+
+# Optional parameters with defaults.
+try:
+    kernel_size = int(sys.argv[3]) if len(sys.argv) > 3 else 99
+except:
+    kernel_size = 99
+try:
+    sigma = float(sys.argv[4]) if len(sys.argv) > 4 else 30
+except:
+    sigma = 30
+
+# Ensure kernel_size is odd.
+if kernel_size % 2 == 0:
+    kernel_size += 1
+
+overwrite_original = True  # You can remove this variable if output_path is always specified.
+
+# Load image.
 image = cv2.imread(image_path)
 if image is None:
     print(f"Error: Could not read the image file '{image_path}'")
-    exit(1)
+    sys.exit(1)
 print("Image loaded successfully.")
 
+# Run OCR to get data.
 data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
 texts = data["text"]
 lefts = data["left"]
@@ -24,9 +52,9 @@ sensitive_labels = ["password", "api key", "secret", "token", "pwd", "pass", "cr
 
 sensitive_patterns = [
     re.compile(r'[a-fA-F0-9]{32,}'),
-    re.compile(r'[A-Za-z0-9-_]{20,}'), 
+    re.compile(r'[A-Za-z0-9-_]{20,}'),
     re.compile(r'eyJ[A-Za-z0-9-_]+\.eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+'),
-    re.compile(r'[A-Za-z0-9+/]{20,}=*'), 
+    re.compile(r'[A-Za-z0-9+/]{20,}=*'),
 ]
 
 sensitive_boxes = []
@@ -52,20 +80,14 @@ print(f"Number of sensitive boxes detected: {len(sensitive_boxes)}")
 
 def blur_region(image, x, y, w, h):
     roi = image[y:y+h, x:x+w]
-    blurred_roi = cv2.GaussianBlur(roi, (99, 99), 30)
+    # Create a kernel tuple (it must be odd).
+    kernel = (kernel_size, kernel_size)
+    blurred_roi = cv2.GaussianBlur(roi, kernel, sigma)
     image[y:y+h, x:x+w] = blurred_roi
 
 for box in sensitive_boxes:
     x, y, w, h = box
     blur_region(image, x, y, w, h)
 
-if overwrite_original:
-    output_path = image_path
-    print(f"Warning: Overwriting the original image at '{output_path}'.")
-else:
-    dir_name = os.path.dirname(image_path)
-    base_name = os.path.basename(image_path)
-    output_path = os.path.join(dir_name, "blurred_" + base_name)
-
 cv2.imwrite(output_path, image)
-print(f"Screenshot saved as '{output_path}'.")
+print(f"Processed image saved as '{output_path}'.")
