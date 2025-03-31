@@ -436,4 +436,3 @@ if __name__ == "__main__":
     app = ScreenshotApp()
     app.connect("destroy", Gtk.main_quit)
     Gtk.main()
-
