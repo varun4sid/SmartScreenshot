@@ -9,14 +9,12 @@ if len(sys.argv) < 3:
     print("Usage: {} <input_image> <output_image> [kernel_size] [sigma]".format(sys.argv[0]))
     sys.exit(1)
 
-# Get file paths from command line.
 image_path = sys.argv[1]
 output_path = sys.argv[2]
 
 print("Image Path : ",image_path)
 print("Output Image Path : ",output_path)
 
-# Optional parameters with defaults.
 try:
     kernel_size = int(sys.argv[3]) if len(sys.argv) > 3 else 99
 except:
@@ -26,20 +24,17 @@ try:
 except:
     sigma = 30
 
-# Ensure kernel_size is odd.
 if kernel_size % 2 == 0:
     kernel_size += 1
 
-overwrite_original = True  # You can remove this variable if output_path is always specified.
+overwrite_original = True
 
-# Load image.
 image = cv2.imread(image_path)
 if image is None:
     print(f"Error: Could not read the image file '{image_path}'")
     sys.exit(1)
 print("Image loaded successfully.")
 
-# Run OCR to get data.
 data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
 texts = data["text"]
 lefts = data["left"]
@@ -80,7 +75,6 @@ print(f"Number of sensitive boxes detected: {len(sensitive_boxes)}")
 
 def blur_region(image, x, y, w, h):
     roi = image[y:y+h, x:x+w]
-    # Create a kernel tuple (it must be odd).
     kernel = (kernel_size, kernel_size)
     blurred_roi = cv2.GaussianBlur(roi, kernel, sigma)
     image[y:y+h, x:x+w] = blurred_roi

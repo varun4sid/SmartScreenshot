@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
-import gi, subprocess, time, sys, os, configparser, json
+import gi, subprocess, time, sys, os, configparser, json, re
 gi.require_version("Gtk", "3.0")
 gi.require_version("Wnck", "3.0")
 gi.require_version("GdkX11", "3.0")
 from gi.repository import Gtk, GdkPixbuf, Gdk, Wnck, GdkX11
+
+# Scan the scripts folder for subdirectories that contain a "main.py"
+def get_available_scripts(scripts_root="scripts"):
+    available = {}
+    if os.path.exists(scripts_root) and os.path.isdir(scripts_root):
+        for entry in os.listdir(scripts_root):
+            subdir = os.path.join(scripts_root, entry)
+            if os.path.isdir(subdir):
+                main_py = os.path.join(subdir, "main.py")
+                if os.path.exists(main_py):
+                    available[entry] = main_py
+    return available
 
 def load_config():
     config = configparser.ConfigParser()
@@ -65,6 +77,57 @@ def load_scripts_config(config):
                 scripts_conf = {"scripts": []}
         return scripts_conf
 
+# Blurring function using OpenCV
+def blur_region(image, x, y, w, h, kernel_size, sigma):
+    roi = image[y:y+h, x:x+w]
+    blurred_roi = cv2.GaussianBlur(roi, (kernel_size, kernel_size), sigma)
+    image[y:y+h, x:x+w] = blurred_roi
+
+# Automatically blur sensitive regions based on OCR results
+def auto_blur(image, kernel_size, sigma):
+    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+    texts = data["text"]
+    lefts = data["left"]
+    tops = data["top"]
+    widths = data["width"]
+    heights = data["height"]
+    print(f"Detected {len([t for t in texts if t.strip()])} non-empty text regions.")
+
+    sensitive_labels = ["password", "api key", "secret", "token", "pwd", "pass", "credential", "key"]
+    sensitive_patterns = [
+        re.compile(r'[a-fA-F0-9]{32,}'),
+        re.compile(r'[A-Za-z0-9-_]{20,}'),
+        re.compile(r'eyJ[A-Za-z0-9-_]+\.eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+'),
+        re.compile(r'[A-Za-z0-9+/]{20,}=*'),
+    ]
+
+    sensitive_boxes = []
+    for i in range(len(texts)):
+        text = texts[i].strip()
+        if not text:
+            continue
+        lower_text = text.lower()
+        if any(label in lower_text for label in sensitive_labels):
+            print(f"Found potential sensitive label: '{texts[i]}'")
+            sensitive_boxes.append((lefts[i], tops[i], widths[i], heights[i]))
+            for j in range(i + 1, len(texts)):
+                if abs(tops[j] - tops[i]) < 10 and texts[j].strip():
+                    print(f"Blurring subsequent sensitive value: '{texts[j]}'")
+                    sensitive_boxes.append((lefts[j], tops[j], widths[j], heights[j]))
+                    break
+        elif any(pattern.search(text) for pattern in sensitive_patterns):
+            print(f"Found potential standalone secret: '{text}'")
+            sensitive_boxes.append((lefts[i], tops[i], widths[i], heights[i]))
+    print(f"Number of sensitive boxes detected: {len(sensitive_boxes)}")
+    for box in sensitive_boxes:
+        x, y, w, h = box
+        blur_region(image, x, y, w, h, kernel_size, sigma)
+    return image
+
+# Import cv2 and pytesseract after function definitions
+import cv2
+import pytesseract
+
 class ScreenshotApp(Gtk.Window):
     def __init__(self):
         super().__init__(title="Screenshot App")
@@ -74,6 +137,7 @@ class ScreenshotApp(Gtk.Window):
         print(f"Using config file: {self.config_file}")
         self.scripts_conf = load_scripts_config(self.config)
 
+        # Read screen resolution.
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor()
         geometry = monitor.get_geometry()
@@ -95,33 +159,46 @@ class ScreenshotApp(Gtk.Window):
             self.main_border_width = int(self.config["General"].get("main_border_width", "10"))
         except ValueError:
             self.main_border_width = 10
-
         try:
             self.thumb_divisor = int(self.config["General"].get("thumbnail_scale_divisor", "4"))
             if self.thumb_divisor <= 0:
                 self.thumb_divisor = 4
         except ValueError:
             self.thumb_divisor = 4
-
         try:
             self.preview_fraction = float(self.config["General"].get("global_preview_scale_fraction", "0.5"))
             if self.preview_fraction <= 0 or self.preview_fraction > 1:
                 self.preview_fraction = 0.5
         except ValueError:
             self.preview_fraction = 0.5
-
         try:
             self.container_border = int(self.config["General"].get("container_border", "2"))
         except ValueError:
             self.container_border = 2
-
         try:
             self.capture_delay = float(self.config["General"].get("capture_delay", "0.5"))
         except ValueError:
             self.capture_delay = 0.5
 
-        self.set_default_size(self.screen_width // 2, self.screen_height // 2)
+        # Store manual blur parameters from command-line (or default)
+        if len(sys.argv) >= 4:
+            try:
+                self.manual_kernel = int(sys.argv[3])
+                if self.manual_kernel % 2 == 0:
+                    self.manual_kernel += 1
+            except:
+                self.manual_kernel = 99
+        else:
+            self.manual_kernel = 99
+        if len(sys.argv) >= 5:
+            try:
+                self.manual_sigma = float(sys.argv[4])
+            except:
+                self.manual_sigma = 30
+        else:
+            self.manual_sigma = 30
 
+        self.set_default_size(self.screen_width // 2, self.screen_height // 2)
         self.last_pixbuf = None
         self.last_capture_name = "None"
 
@@ -138,16 +215,12 @@ class ScreenshotApp(Gtk.Window):
 
         button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         window_box.pack_start(button_box, False, False, 0)
-
         capture_full_btn = Gtk.Button(label="Capture Full Screen")
         capture_full_btn.connect("clicked", self.on_capture_full_clicked)
         button_box.pack_start(capture_full_btn, False, False, 0)
-
         refresh_btn = Gtk.Button(label="Refresh Window List")
         refresh_btn.connect("clicked", lambda b: self.populate_window_list())
         button_box.pack_start(refresh_btn, False, False, 0)
-
-        # New: Upload Image button.
         upload_btn = Gtk.Button(label="Upload Image")
         upload_btn.connect("clicked", self.on_upload_image)
         button_box.pack_start(upload_btn, False, False, 0)
@@ -169,46 +242,16 @@ class ScreenshotApp(Gtk.Window):
         notebook.append_page(window_frame, Gtk.Label(label="Window Capture"))
 
         # --- Tab: Scripts ---
-        script_paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
-        script_paned.connect("size-allocate", self.on_script_paned_allocate)
-
-        self.script_flow = Gtk.FlowBox()
-        self.script_flow.set_valign(Gtk.Align.START)
-        self.script_flow.set_max_children_per_line(2)
-        self.script_flow.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.script_flow.set_row_spacing(10)
-        self.script_flow.set_column_spacing(10)
-        scrolled_scripts = Gtk.ScrolledWindow()
-        scrolled_scripts.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scrolled_scripts.add(self.script_flow)
-
-        script_top_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        script_top_box.pack_start(scrolled_scripts, True, True, 0)
-        preview_proc_btn = Gtk.Button(label="Preview Processed Image")
-        preview_proc_btn.connect("clicked", self.on_preview_processed)
-        script_top_box.pack_start(preview_proc_btn, False, False, 0)
-        script_paned.pack1(script_top_box, True, False)
-
-        # Load script sections from the external JSON config.
-        scripts = self.scripts_conf.get("scripts", [])
-        if not scripts:
-            scripts = [{
-                "name": "Generic Script",
-                "path": "process_image.py",
-                "parameters": [{"label": "Custom Parameter", "default": "1.0"}]
-            }]
-        for script in scripts:
-            name = script.get("name", "Unnamed Script")
-            path = script.get("path", "")
-            params_list = script.get("parameters", [])
-            parameters = []
-            for param in params_list:
-                label = param.get("label", "Param")
-                default = param.get("default", "")
-                parameters.append((label, default))
-            section = self.create_script_section(script_title=name, script_name=path, parameters=parameters)
-            self.script_flow.add(section)
-
+        scripts_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        scripts_vbox.set_border_width(self.main_border_width)
+        # Script selector (combo box, extra parameters, and Run Script button)
+        selector_box = self.create_script_selector()
+        scripts_vbox.pack_start(selector_box, False, False, 0)
+        # Add a button for Manual Blur via keyword input
+        manual_blur_btn = Gtk.Button(label="Manual Blur (Enter Keyword)")
+        manual_blur_btn.connect("clicked", self.show_keyword_dialog)
+        scripts_vbox.pack_start(manual_blur_btn, False, False, 0)
+        # Add preview frame for last capture.
         preview_scrolled = Gtk.ScrolledWindow()
         preview_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         preview_frame = Gtk.Frame(label="Last Captured Image")
@@ -225,40 +268,94 @@ class ScreenshotApp(Gtk.Window):
         self.global_preview.set_hexpand(True)
         self.global_preview.set_vexpand(True)
         preview_box.pack_start(self.global_preview, True, True, 0)
-        script_paned.pack2(preview_scrolled, False, False)
-        notebook.append_page(script_paned, Gtk.Label(label="Scripts"))
+        scripts_vbox.pack_start(preview_scrolled, True, True, 0)
+
+        notebook.append_page(scripts_vbox, Gtk.Label(label="Scripts"))
 
         self.show_all()
 
-    def on_script_paned_allocate(self, widget, allocation):
-        widget.set_position(allocation.height // 2)
+    def create_script_selector(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        label = Gtk.Label(label="Select Script:")
+        box.pack_start(label, False, False, 0)
+        
+        combo = Gtk.ComboBoxText()
+        available = get_available_scripts()
+        for key, path in available.items():
+            combo.append(key, path)
+        if "secrets-handling" in available:
+            combo.set_active_id("secrets-handling")
+        else:
+            combo.set_active(0)
+        box.pack_start(combo, False, False, 0)
+        
+        param_label = Gtk.Label(label="Extra Parameters:")
+        box.pack_start(param_label, False, False, 0)
+        entry = Gtk.Entry()
+        box.pack_start(entry, True, True, 0)
+        
+        run_btn = Gtk.Button(label="Run Script")
+        run_btn.connect("clicked", self.on_run_selected_script, combo, entry)
+        box.pack_start(run_btn, False, False, 0)
+        
+        return box
 
-    def create_script_section(self, script_title, script_name, parameters):
-        section_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        section_box.set_border_width(self.main_border_width)
-        title_label = Gtk.Label()
-        title_label.set_markup(f"<b>{script_title}</b>")
-        title_label.set_xalign(0)
-        section_box.pack_start(title_label, False, False, 0)
-        grid = Gtk.Grid(column_spacing=10, row_spacing=10)
-        section_box.pack_start(grid, False, False, 0)
-        section_box.param_entries = []
-        for i, (param_label, default) in enumerate(parameters):
-            lbl = Gtk.Label(label=param_label + ":")
-            lbl.set_xalign(1)
-            entry = Gtk.Entry()
-            entry.set_text(default)
-            section_box.param_entries.append(entry)
-            grid.attach(lbl, 0, i, 1, 1)
-            grid.attach(entry, 1, i, 1, 1)
-        btn = Gtk.Button(label=f"Run {script_title}")
-        btn.connect("clicked", self.on_run_script, script_name, section_box)
-        section_box.pack_start(btn, False, False, 0)
-        frame = Gtk.Frame()
-        frame.set_shadow_type(Gtk.ShadowType.IN)
-        frame.set_border_width(self.container_border)
-        frame.add(section_box)
-        return frame
+    def on_run_selected_script(self, button, combo, entry):
+        script_path = combo.get_active_id()
+        extra_params = entry.get_text().strip()
+        if self.last_pixbuf is None:
+            print("No capture available!")
+            return
+        temp_input = "last_capture.png"
+        self.last_pixbuf.savev(temp_input, "png", [], [])
+        cmd = ["python3", script_path, temp_input, "output.png"]
+        if extra_params:
+            cmd.extend(extra_params.split())
+        print("Running script:", " ".join(cmd))
+        subprocess.run(cmd)
+
+    def show_keyword_dialog(self, button):
+        dialog = Gtk.Dialog(title="Enter Keyword to Blur", transient_for=self, modal=True)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                           "Apply", Gtk.ResponseType.APPLY,
+                           "Done", Gtk.ResponseType.OK)
+        content_area = dialog.get_content_area()
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("Enter keyword (e.g. password, host, etc.)")
+        content_area.add(entry)
+        dialog.show_all()
+        while True:
+            response = dialog.run()
+            if response == Gtk.ResponseType.APPLY:
+                keyword = entry.get_text().strip().lower()
+                if keyword:
+                    self.manual_blur_by_keyword(keyword)
+                    entry.set_text("")
+            elif response in (Gtk.ResponseType.OK, Gtk.ResponseType.CANCEL):
+                break
+        dialog.destroy()
+
+    def manual_blur_by_keyword(self, keyword):
+        # Save the current capture to a temporary file and run OCR on it.
+        temp_file = "temp_capture.png"
+        self.last_pixbuf.savev(temp_file, "png", [], [])
+        image = cv2.imread(temp_file)
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+        texts = data["text"]
+        lefts = data["left"]
+        tops = data["top"]
+        widths = data["width"]
+        heights = data["height"]
+        count = 0
+        for i in range(len(texts)):
+            if keyword in texts[i].lower():
+                blur_region(image, lefts[i], tops[i], widths[i], heights[i],
+                            self.manual_kernel, self.manual_sigma)
+                count += 1
+        print(f"Blurred {count} regions containing '{keyword}'.")
+        cv2.imwrite(temp_file, image)
+        self.last_pixbuf = GdkPixbuf.Pixbuf.new_from_file(temp_file)
+        self.update_global_preview(self.last_pixbuf, self.last_capture_name)
 
     def update_global_preview(self, pixbuf, capture_name):
         self.last_pixbuf = pixbuf
@@ -273,7 +370,6 @@ class ScreenshotApp(Gtk.Window):
             self.global_preview.set_from_pixbuf(scaled)
 
     def show_preview_dialog(self, pixbuf, title="Preview"):
-        # Instead of an internal preview dialog, we open with the system's default image viewer.
         temp_path = "temp_preview.png"
         pixbuf.savev(temp_path, "png", [], [])
         try:
@@ -297,6 +393,8 @@ class ScreenshotApp(Gtk.Window):
             print("Screenshot failed (pb is None). Are you on X11?")
             return
         pb.savev("screenshot.png", "png", [], [])
+        abs_path = os.path.abspath("screenshot.png")
+        print("Screenshot saved at:", abs_path)
         self.update_global_preview(pb, "Full Screen")
         self.show_preview_dialog(pb, title="Full Screen Preview")
 
@@ -364,8 +462,15 @@ class ScreenshotApp(Gtk.Window):
             print("Failed to capture window with XID", xid)
             return
         pb.savev("window_screenshot.png", "png", [], [])
+        abs_path = os.path.abspath("window_screenshot.png")
+        print("Window screenshot saved at:", abs_path)
         self.update_global_preview(pb, button.get_label())
         self.show_preview_dialog(pb, title="Window Capture Preview")
+        
+        secrets_script = os.path.join("scripts", "secrets-handling", "main.py")
+        cmd = ["python3", secrets_script, abs_path, "output.png", "51", "20"]
+        print("Running secrets-handling script with command:", " ".join(cmd))
+        subprocess.run(cmd)
 
     def on_run_script(self, button, script_name, container):
         if self.last_pixbuf is None:
@@ -376,7 +481,7 @@ class ScreenshotApp(Gtk.Window):
         params = []
         if container is not None and hasattr(container, "param_entries"):
             params = [entry.get_text() for entry in container.param_entries]
-        subprocess.run(["python3", script_name, temp_input, "processed.png"] + params)
+        subprocess.run(["python3", script_name, temp_input, "last_capture.png"] + params)
         try:
             pb_processed = GdkPixbuf.Pixbuf.new_from_file("processed.png")
             self.show_preview_dialog(pb_processed, title=f"{script_name} Preview")
@@ -422,12 +527,16 @@ class ScreenshotApp(Gtk.Window):
         if response == Gtk.ResponseType.OK:
             selected_file = dialog.get_filename()
             print("Selected file:", selected_file)
-            # Load the selected image.
             pb = GdkPixbuf.Pixbuf.new_from_file(selected_file)
             if pb:
                 self.last_pixbuf = pb
                 self.last_capture_name = os.path.basename(selected_file)
                 self.update_global_preview(pb, self.last_capture_name)
+                abs_path = os.path.abspath(selected_file)
+                secrets_script = os.path.join("scripts", "secrets-handling", "main.py")
+                cmd = ["python3", secrets_script, abs_path, "output.png", "51", "20"]
+                print("Running secrets-handling script with command:", " ".join(cmd))
+                subprocess.run(cmd)
             else:
                 print("Failed to load the selected image.")
         dialog.destroy()

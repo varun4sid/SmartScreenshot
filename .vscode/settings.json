@@ -1,0 +1,8 @@
+{
+    "python.analysis.extraPaths": [
+        "/usr/lib64/python3.13/site-packages"
+    ],
+    "python.analysis.diagnosticSeverityOverrides": {
+        "reportMissingImports": "none"
+    }
+}
